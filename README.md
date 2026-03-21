@@ -9,7 +9,6 @@ A tool for working with texture archives from Go Vacation (Wii). Supports extrac
 
 # This is an experimental tool which is not yet completed. It's currently only for testing purposes. A proper writeup will probably follow when im done understanding all the file formats.
 
---
 
 ---
 

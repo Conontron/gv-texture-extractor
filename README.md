@@ -1,5 +1,7 @@
 # Texture Extractor
 
+# This is an experimental tool which is not yet completed. It's currently only for testing purposes. 
+
 A Python command-line tool for locating and extracting textures from supported Wii GX and Nintendo Switch BNTX containers. It can process individual files, recursively process folders, or scan binary files for embedded textures.
 
 Extracted textures are written as PNG files. A JSON manifest is created for each processed input file.

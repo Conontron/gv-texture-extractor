@@ -1,9 +1,15 @@
 import sys
 import os
+import json
 import struct
-import math
 import argparse
 from pathlib import Path
+
+try:
+    import numpy as np
+except ImportError:
+    print("Error: numpy is required.  pip install numpy")
+    sys.exit(1)
 
 try:
     from PIL import Image
@@ -12,188 +18,6 @@ except ImportError:
     sys.exit(1)
 
 
-# GX colour helpers 
-
-def _rgb565(v):
-    r = ((v >> 11) & 0x1F) * 255 // 31
-    g = ((v >>  5) & 0x3F) * 255 // 63
-    b = ( v        & 0x1F) * 255 // 31
-    return (r, g, b, 255)
-
-
-def _rgb5a3(v):
-    if v & 0x8000:                              # RGB555
-        r = ((v >> 10) & 0x1F) * 255 // 31
-        g = ((v >>  5) & 0x1F) * 255 // 31
-        b = ( v        & 0x1F) * 255 // 31
-        return (r, g, b, 255)
-    else:                                       # RGB4A3 
-        a = ((v >> 12) & 0x7) * 255 // 7
-        r = ((v >>  8) & 0xF) * 255 // 15
-        g = ((v >>  4) & 0xF) * 255 // 15
-        b = ( v        & 0xF) * 255 // 15
-        return (r, g, b, a)
-
-
-# Mip-chain size 
-
-_FMT_PARAMS = {
-    5:  (4, 4, 2),      # RGB5A3
-    6:  (4, 4, 4),      # RGBA8
-    8:  (8, 8, 0.5),    # C4
-    9:  (8, 4, 1.0),    # C8
-    14: (8, 8, 0.5),    # CMPR
-}
-
-def mip_chain_bytes(w, h, mips, fmt):
-    tw, th, bpp = _FMT_PARAMS.get(fmt, (4, 4, 1))
-    total = 0
-    for m in range(mips):
-        mw = max(tw, math.ceil(max(1, w >> m) / tw) * tw)
-        mh = max(th, math.ceil(max(1, h >> m) / th) * th)
-        total += int(mw * mh * bpp)
-    return total
-
-
-# Format decoders 
-
-def decode_cmpr(pixels, w, h):
-    """
-    CMPR = GX variant of DXT1.
-    Layout: 8x8 super-tiles each containing four 4x4 DXT1 sub-blocks.
-    Colour order in each sub-block is SWAPPED vs PC DXT1 (c0/c1 reversed
-    for the transparent/black entry selection).
-    """
-    out = bytearray(w * h * 4)
-    tiles_x = max(1, (w + 7) // 8)
-    tiles_y = max(1, (h + 7) // 8)
-    pos = 0
-    for ty in range(tiles_y):
-        for tx in range(tiles_x):
-            for sub_y in range(2):
-                for sub_x in range(2):
-                    blk = pixels[pos:pos + 8]; pos += 8
-                    c0 = struct.unpack_from('>H', blk, 0)[0]
-                    c1 = struct.unpack_from('>H', blk, 2)[0]
-                    lut = struct.unpack_from('>I', blk, 4)[0]
-
-                    def e565(c):
-                        r = ((c >> 11) & 0x1F) * 255 // 31
-                        g = ((c >>  5) & 0x3F) * 255 // 63
-                        b = ( c        & 0x1F) * 255 // 31
-                        return (r, g, b, 255)
-
-                    col = [e565(c0), e565(c1)]
-                    if c0 > c1:
-                        col.append(tuple((2*a + b) // 3 for a, b in zip(col[0], col[1])))
-                        col.append(tuple((a + 2*b) // 3 for a, b in zip(col[0], col[1])))
-                    else:
-                        col.append(tuple((a + b) // 2 for a, b in zip(col[0], col[1])))
-                        col.append((0, 0, 0, 0))   # transparent
-
-                    for py in range(4):
-                        for px in range(4):
-                            bit_pos = (py * 4 + px) * 2
-                            idx = (lut >> (30 - bit_pos)) & 3
-                            ox = tx * 8 + sub_x * 4 + px
-                            oy = ty * 8 + sub_y * 4 + py
-                            if ox < w and oy < h:
-                                o = (oy * w + ox) * 4
-                                out[o:o + 4] = col[idx]
-    return bytes(out)
-
-
-def decode_rgb5a3_direct(pixels, w, h):
-    """RGB5A3: 4x4 tiles, 2 bytes per pixel."""
-    out = bytearray(w * h * 4)
-    tiles_x = max(1, (w + 3) // 4)
-    tiles_y = max(1, (h + 3) // 4)
-    pos = 0
-    for ty in range(tiles_y):
-        for tx in range(tiles_x):
-            tile = pixels[pos:pos + 32]; pos += 32
-            for py in range(4):
-                for px in range(4):
-                    ni = py * 4 + px
-                    v = struct.unpack_from('>H', tile, ni * 2)[0] if ni * 2 + 1 < len(tile) else 0
-                    col = _rgb5a3(v)
-                    ox = tx * 4 + px; oy = ty * 4 + py
-                    if ox < w and oy < h:
-                        o = (oy * w + ox) * 4
-                        out[o:o + 4] = col
-    return bytes(out)
-
-
-def decode_rgba8(pixels, w, h):
-    """RGBA8: 4x4 tiles, 32 bytes per tile (split AR / GB planes)."""
-    out = bytearray(w * h * 4)
-    tiles_x = max(1, (w + 3) // 4)
-    tiles_y = max(1, (h + 3) // 4)
-    pos = 0
-    for ty in range(tiles_y):
-        for tx in range(tiles_x):
-            tile = pixels[pos:pos + 64]; pos += 64
-            for py in range(4):
-                for px in range(4):
-                    ni = py * 4 + px
-                    a = tile[ni * 2]
-                    r = tile[ni * 2 + 1]
-                    g = tile[32 + ni * 2]
-                    b = tile[32 + ni * 2 + 1]
-                    ox = tx * 4 + px; oy = ty * 4 + py
-                    if ox < w and oy < h:
-                        o = (oy * w + ox) * 4
-                        out[o:o + 4] = (r, g, b, a)
-    return bytes(out)
-
-
-def decode_c4(pixels, palette_u16, w, h, tlut_fmt):
-    """C4: 8x8 tiles, 4-bit indexed."""
-    dec = _rgb565 if tlut_fmt == 1 else _rgb5a3
-    out = bytearray(w * h * 4)
-    tiles_x = max(1, (w + 7) // 8)
-    tiles_y = max(1, (h + 7) // 8)
-    pos = 0
-    for ty in range(tiles_y):
-        for tx in range(tiles_x):
-            tile = pixels[pos:pos + 32]; pos += 32
-            for py in range(8):
-                for px in range(8):
-                    ni = py * 8 + px
-                    byte = tile[ni // 2] if ni // 2 < len(tile) else 0
-                    idx = (byte >> 4) if (ni % 2 == 0) else (byte & 0xF)
-                    col = dec(palette_u16[idx]) if idx < len(palette_u16) else (255, 0, 255, 255)
-                    ox = tx * 8 + px; oy = ty * 8 + py
-                    if ox < w and oy < h:
-                        o = (oy * w + ox) * 4
-                        out[o:o + 4] = col
-    return bytes(out)
-
-
-def decode_c8(pixels, palette_u16, w, h, tlut_fmt):
-    """C8: 8x4 tiles, 8-bit indexed."""
-    dec = _rgb565 if tlut_fmt == 1 else _rgb5a3
-    out = bytearray(w * h * 4)
-    tiles_x = max(1, (w + 7) // 8)
-    tiles_y = max(1, (h + 3) // 4)
-    pos = 0
-    for ty in range(tiles_y):
-        for tx in range(tiles_x):
-            tile = pixels[pos:pos + 32]; pos += 32
-            for py in range(4):
-                for px in range(8):
-                    ni = py * 8 + px
-                    byte = tile[ni] if ni < len(tile) else 0
-                    col = dec(palette_u16[byte]) if byte < len(palette_u16) else (255, 0, 255, 255)
-                    ox = tx * 8 + px; oy = ty * 4 + py
-                    if ox < w and oy < h:
-                        o = (oy * w + ox) * 4
-                        out[o:o + 4] = col
-    return bytes(out)
-
-
-# WST reader (shared by ArcL and WPT)
-
 GX_FMT = {
     0: 'I4', 1: 'I8', 2: 'IA4', 3: 'IA8',
     4: 'RGB565', 5: 'RGB5A3', 6: 'RGBA8',
@@ -201,268 +25,617 @@ GX_FMT = {
 }
 TLUT_FMT = {0: 'IA8', 1: 'RGB565', 2: 'RGB5A3'}
 
-PALETTE_FREE   = {5, 6, 14}
-PALETTE_NEEDED = {8, 9}
+GX_BLOCK = {
+    0: (8, 8, 4), 1: (8, 4, 8), 2: (8, 4, 8), 3: (4, 4, 16),
+    4: (4, 4, 16), 5: (4, 4, 16), 6: (4, 4, 32),
+    8: (8, 8, 4), 9: (8, 4, 8), 10: (4, 4, 16), 14: (8, 8, 4),
+}
+INDEXED = {8: 16, 9: 256, 10: 16384}
 
 
-def read_wst(data, wst_off):
-    """
-    Parse a WST header at wst_off and return an info dict, or None if no WST magic.
-    tex_start = wst_off + 0x20 (pixel data begins right after the 32-byte WST header).
-    """
-    wst = data[wst_off:]
-    if wst[:4] != b'WST\x00':
-        return None
-
-    fmt      = wst[0x10]
-    mips     = wst[0x11]
-    npal     = wst[0x12]
-    width    = struct.unpack_from('>H', wst, 0x14)[0]
-    height   = struct.unpack_from('>H', wst, 0x16)[0]
-    tlut_fmt = struct.unpack_from('>H', wst, 0x18)[0]
-    tlut_cnt = struct.unpack_from('>H', wst, 0x1a)[0]
-    data_sz  = struct.unpack_from('>I', wst, 0x1c)[0]
-
-    tex_start = wst_off + 0x20
-    mc        = mip_chain_bytes(width, height, mips, fmt)
-    pal_data  = data[tex_start + mc : tex_start + data_sz]
-
-    return {
-        'fmt':       fmt,
-        'fmt_name':  GX_FMT.get(fmt, f'unk{fmt:#x}'),
-        'mips':      mips,
-        'npal':      npal,
-        'width':     width,
-        'height':    height,
-        'tlut_fmt':  tlut_fmt,
-        'tlut_cnt':  tlut_cnt,
-        'data_sz':   data_sz,
-        'tex_start': tex_start,
-        'mip_bytes': mc,
-        'pal_data':  pal_data,
-    }
+def level_bytes(fmt, w, h):
+    bw, bh, bpp = GX_BLOCK[fmt]
+    return (-(-w // bw) * bw) * (-(-h // bh) * bh) * bpp // 8
 
 
-# ArcL parser
-
-def parse_arcl(data):
-    """
-    Yield (index, info) for each WST entry in an ArcL archive.
-    ArcL entry layout: 0x20 bytes pre-WST, then WST header at entry_offset+0x20.
-    """
-    count   = struct.unpack_from('>I', data, 4)[0]
-    offsets = [struct.unpack_from('>I', data, 0x20 + i * 4)[0] for i in range(count)]
-
-    for idx, off in enumerate(offsets):
-        info = read_wst(data, off + 0x20)
-        yield idx, info
+def mip_chain_bytes(fmt, w, h, levels):
+    return sum(level_bytes(fmt, max(1, w >> i), max(1, h >> i)) for i in range(levels))
 
 
-# WPT parser
-
-def parse_wpt(data):
-    """
-    Yield (index, info) for each WST entry in a WPT archive.
-
-    WPT header layout:
-      0x00  magic "WPT\0"
-      0x04  u32 version (1)
-      0x10  u32 offset_table_start  (always 0x20)
-      0x14  u32 offset_table_end    (also = section1_ptr, WST at +0x10)
-      0x18  u32 section2_ptr        (WST at +0x10)
-      0x1c  u32 section3_ptr        (WST at +0x10)
-
-    All entries (sections and offset table) have 0x10 bytes pre-WST,
-    so WST header is always at entry_pointer + 0x10.
-    """
-    tbl_start = struct.unpack_from('>I', data, 0x10)[0]
-    tbl_end   = struct.unpack_from('>I', data, 0x14)[0]
-    sec2_ptr  = struct.unpack_from('>I', data, 0x18)[0]
-    sec3_ptr  = struct.unpack_from('>I', data, 0x1c)[0]
-
-    
-    wst_ptrs = [tbl_end, sec2_ptr, sec3_ptr]
-    count = (tbl_end - tbl_start) // 4
-    for i in range(count):
-        v = struct.unpack_from('>I', data, tbl_start + i * 4)[0]
-        if v != 0:
-            wst_ptrs.append(v)
-
-    for idx, ptr in enumerate(wst_ptrs):
-        info = read_wst(data, ptr + 0x10)
-        yield idx, info
+def _x5(v):
+    return ((v << 3) | (v >> 2)).astype(np.uint8)
 
 
+def _x6(v):
+    return ((v << 2) | (v >> 4)).astype(np.uint8)
 
 
-def parse_file(data):
-    """Auto-detect ArcL or WPT and return (container_type, generator)."""
-    magic = data[:4]
-    if magic == b'ArcL':
-        return 'ArcL', parse_arcl(data)
-    elif magic == b'WPT\x00':
-        return 'WPT', parse_wpt(data)
+def _x4(v):
+    return (v * 17).astype(np.uint8)
+
+
+def _x3(v):
+    return ((v << 5) | (v << 2) | (v >> 1)).astype(np.uint8)
+
+
+def rgb565(v):
+    v = v.astype(np.uint32)
+    return np.stack([_x5((v >> 11) & 0x1F), _x6((v >> 5) & 0x3F), _x5(v & 0x1F),
+                     np.full(v.shape, 255, np.uint8)], -1)
+
+
+def rgb5a3(v):
+    v = v.astype(np.uint32)
+    opaque = (v & 0x8000) != 0
+    r = np.where(opaque, _x5((v >> 10) & 0x1F), _x4((v >> 8) & 0xF))
+    g = np.where(opaque, _x5((v >> 5) & 0x1F), _x4((v >> 4) & 0xF))
+    b = np.where(opaque, _x5(v & 0x1F), _x4(v & 0xF))
+    a = np.where(opaque, 255, _x3((v >> 12) & 0x7))
+    return np.stack([r, g, b, a], -1).astype(np.uint8)
+
+
+def ia8(v):
+    """IA8 as u16: high byte = alpha, low byte = intensity."""
+    v = v.astype(np.uint32)
+    i = (v & 0xFF).astype(np.uint8)
+    a = (v >> 8).astype(np.uint8)
+    return np.stack([i, i, i, a], -1)
+
+
+TLUT_DECODE = {0: ia8, 1: rgb565, 2: rgb5a3}
+
+
+def decode_palette(raw, tlut_fmt):
+    """raw palette bytes -> (n, 4) RGBA array."""
+    v = np.frombuffer(raw, '>u2')
+    return TLUT_DECODE.get(tlut_fmt, rgb5a3)(v)
+
+
+def _untile(texels, w, h, bw, bh):
+    """texels: (ntiles * bh * bw, C) in GX tile order -> (h, w, C)."""
+    tx, ty = -(-w // bw), -(-h // bh)
+    c = texels.shape[-1]
+    t = texels.reshape(ty, tx, bh, bw, c).transpose(0, 2, 1, 3, 4)
+    return t.reshape(ty * bh, tx * bw, c)[:h, :w]
+
+
+def _nibbles(raw):
+    b = np.frombuffer(raw, np.uint8)
+    return np.stack([b >> 4, b & 0xF], -1).reshape(-1)
+
+
+def _cmpr_blocks(raw):
+    blk = np.frombuffer(raw, np.uint8).reshape(-1, 8)
+    c0 = (blk[:, 0].astype(np.uint32) << 8) | blk[:, 1]
+    c1 = (blk[:, 2].astype(np.uint32) << 8) | blk[:, 3]
+    p0 = rgb565(c0).astype(np.int32)
+    p1 = rgb565(c1).astype(np.int32)
+    four = (c0 > c1)[:, None]
+    p2 = np.where(four, (p0 * 5 + p1 * 3) >> 3, (p0 + p1) >> 1)
+    p3 = np.where(four, (p0 * 3 + p1 * 5) >> 3, (p0 + p1) >> 1)
+    p2[:, 3] = 255
+    p3[:, 3] = np.where(four[:, 0], 255, 0)
+    pal = np.stack([p0, p1, p2, p3], 1).astype(np.uint8)
+    bits = blk[:, 4:8]
+    idx = np.stack([(bits >> s) & 3 for s in (6, 4, 2, 0)], -1).reshape(-1, 16)
+    out = np.take_along_axis(pal, idx[:, :, None].astype(np.intp), 1)
+    return out.reshape(-1, 4, 4, 4)
+
+
+def decode_level(fmt, raw, w, h, palette=None):
+    bw, bh, _ = GX_BLOCK[fmt]
+    if fmt == 14:
+        blocks = _cmpr_blocks(raw)
+        tx, ty = -(-w // 8), -(-h // 8)
+        t = blocks.reshape(ty, tx, 2, 2, 4, 4, 4).transpose(0, 2, 4, 1, 3, 5, 6)
+        return t.reshape(ty * 8, tx * 8, 4)[:h, :w]
+    if fmt == 6:
+        t = np.frombuffer(raw, np.uint8).reshape(-1, 2, 16, 2)
+        texels = np.stack([t[:, 0, :, 1], t[:, 1, :, 0], t[:, 1, :, 1], t[:, 0, :, 0]], -1)
+        return _untile(texels.reshape(-1, 4), w, h, bw, bh)
+
+    if fmt in (0, 8):
+        v = _nibbles(raw)
+    elif fmt in (1, 2, 9):
+        v = np.frombuffer(raw, np.uint8)
     else:
-        raise ValueError(f"Unknown format (magic={magic!r})")
+        v = np.frombuffer(raw, '>u2')
+
+    if fmt == 0:
+        i = _x4(v)
+        texels = np.stack([i, i, i, i], -1)
+    elif fmt == 1:
+        texels = np.stack([v, v, v, v], -1)
+    elif fmt == 2:
+        i = _x4(v & 0xF)
+        a = _x4(v >> 4)
+        texels = np.stack([i, i, i, a], -1)
+    elif fmt == 3:
+        texels = ia8(v)
+    elif fmt == 4:
+        texels = rgb565(v)
+    elif fmt == 5:
+        texels = rgb5a3(v)
+    else:
+        if fmt == 10:
+            v = v & 0x3FFF
+        if palette is None:
+            i = (v * (255 // (INDEXED[fmt] - 1))).astype(np.uint8)
+            texels = np.stack([i, i, i, np.full_like(i, 255)], -1)
+        else:
+            pal = palette
+            if len(pal) < INDEXED[fmt]:
+                pad = np.zeros((INDEXED[fmt] - len(pal), 4), np.uint8)
+                pal = np.concatenate([pal, pad])
+            texels = pal[v]
+    return _untile(texels, w, h, bw, bh)
 
 
-# Entry extractor
+WST_HDR = 0x20
 
-def extract_entry(data, idx, info, out_dir, skip_indexed=False, verbose=False):
-    """Decode one WST entry and save PNG(s). Returns list of saved paths."""
-    fmt      = info['fmt']
-    w        = info['width']
-    h        = info['height']
-    mips     = info['mips']
-    tlut_fmt = info['tlut_fmt']
-    tlut_cnt = info['tlut_cnt']
-    mc       = info['mip_bytes']
-    ts       = info['tex_start']
-    pal_data = info['pal_data']
-    fname    = info['fmt_name']
 
-    if verbose:
-        pal_note = f"tlut={TLUT_FMT.get(tlut_fmt,'?')}({tlut_cnt})" if fmt in PALETTE_NEEDED else ""
-        print(f"  [{idx:3d}] {w:4d}x{h:<4d}  {fname:7s}  mips={mips}  {pal_note}")
+def parse_wst(data, off):
+    if data[off:off + 4] != b'WST\x00' or off + WST_HDR > len(data):
+        return None
+    fmt, extra_mips, tlut_fmt = data[off + 0x10], data[off + 0x11], data[off + 0x12]
+    w, h, pal_units, pal_size = struct.unpack_from('>HHHH', data, off + 0x14)
+    data_size = struct.unpack_from('>I', data, off + 0x1c)[0]
+    tex_id = struct.unpack_from('>I', data, off + 0x08)[0]
+    levels = extra_mips + 1
+    info = {
+        'kind': 'wst', 'offset': off, 'id': tex_id, 'fmt': fmt, 'fmt_name': GX_FMT.get(fmt, f'unk{fmt}'),
+        'width': w, 'height': h, 'levels': levels, 'tlut_fmt': tlut_fmt,
+        'pal_entries': pal_units * 16, 'pal_size': pal_size, 'data_size': data_size,
+        'pal_start': off + WST_HDR, 'pix_start': off + WST_HDR + pal_size,
+        'valid': False,
+    }
+    if fmt in GX_BLOCK and w and h:
+        expect = pal_size + mip_chain_bytes(fmt, w, h, levels)
+        info['valid'] = (expect == data_size and off + WST_HDR + data_size <= len(data))
+    return info
 
-    pixels = data[ts : ts + mc]
-    saved  = []
 
-    if mc == 0 or w == 0 or h == 0:
-        return saved  
+def wst_palettes(data, info):
+    """Return list of (n, 4) RGBA palettes stored in the WST palette block."""
+    fmt = info['fmt']
+    if fmt not in INDEXED or not info['pal_size']:
+        return []
+    n = info['pal_entries'] or INDEXED[fmt]
+    raw = data[info['pal_start']:info['pal_start'] + info['pal_size']]
+    step = n * 2
+    return [decode_palette(raw[i:i + step], info['tlut_fmt'])
+            for i in range(0, len(raw) - step + 1, step)]
 
-    # palette-free formats
-    if fmt == 14:   # CMPR
-        rgba = decode_cmpr(pixels, w, h)
-        path = out_dir / f"{idx:03d}_{w}x{h}_CMPR.png"
-        Image.frombytes('RGBA', (w, h), rgba).save(path)
-        saved.append(path)
 
-    elif fmt == 5:  # RGB5A3
-        rgba = decode_rgb5a3_direct(pixels, w, h)
-        path = out_dir / f"{idx:03d}_{w}x{h}_RGB5A3.png"
-        Image.frombytes('RGBA', (w, h), rgba).save(path)
-        saved.append(path)
+def wst_levels(data, info):
+    """Yield (level, w, h, raw bytes)."""
+    pos = info['pix_start']
+    for lv in range(info['levels']):
+        w, h = max(1, info['width'] >> lv), max(1, info['height'] >> lv)
+        n = level_bytes(info['fmt'], w, h)
+        yield lv, w, h, data[pos:pos + n]
+        pos += n
 
-    elif fmt == 6:  # RGBA8
-        rgba = decode_rgba8(pixels, w, h)
-        path = out_dir / f"{idx:03d}_{w}x{h}_RGBA8.png"
-        Image.frombytes('RGBA', (w, h), rgba).save(path)
-        saved.append(path)
 
-    # palette-indexed formats
-    elif fmt == 8 and not skip_indexed:   # C4
-        n_raw     = len(pal_data) // 2
-        n_pal     = max(1, min(tlut_cnt // 16 if tlut_cnt else n_raw // 16, n_raw // 16))
-        all_pal   = [struct.unpack_from('>H', pal_data, j * 2)[0] for j in range(n_raw)]
-        for p in range(n_pal):
-            pal16 = (all_pal[p * 16 : p * 16 + 16] + [0] * 16)[:16]
-            rgba = decode_c4(pixels, pal16, w, h, tlut_fmt)
-            suf  = f"_p{p}" if n_pal > 1 else ""
-            path = out_dir / f"{idx:03d}_{w}x{h}_C4{suf}.png"
-            Image.frombytes('RGBA', (w, h), rgba).save(path)
-            saved.append(path)
+BNTX_FMT = {
+    0x02: ('R8', 1, 1, 1), 0x03: ('RGBA4', 1, 1, 2), 0x07: ('RGB565', 1, 1, 2),
+    0x09: ('RG8', 1, 1, 2), 0x0b: ('RGBA8', 1, 1, 4), 0x0c: ('BGRA8', 1, 1, 4),
+    0x1a: ('BC1', 4, 4, 8), 0x1b: ('BC2', 4, 4, 16), 0x1c: ('BC3', 4, 4, 16),
+    0x1d: ('BC4', 4, 4, 8), 0x1e: ('BC5', 4, 4, 16), 0x1f: ('BC6H', 4, 4, 16),
+    0x20: ('BC7', 4, 4, 16),
+}
+_BCN_PIL = {'BC1': (1, 'BC1', 'RGBA'), 'BC2': (2, 'BC2', 'RGBA'), 'BC3': (3, 'BC3', 'RGBA'),
+            'BC4': (4, 'BC4', 'L'), 'BC5': (5, 'BC5', 'RGB'), 'BC6H': (6, 'BC6H', 'RGB'),
+            'BC7': (7, 'BC7', 'RGBA')}
 
-    elif fmt == 9 and not skip_indexed:   # C8
-        PAL  = 512  # 256 entries x 2 bytes
-        n_av = max(1, len(pal_data) // PAL)
-        n_dc = max(1, tlut_cnt // 256) if tlut_cnt >= 256 else 1
-        n_pal = min(n_av, n_dc)
-        for p in range(n_pal):
-            raw  = pal_data[p * PAL : p * PAL + PAL]
-            pal  = ([struct.unpack_from('>H', raw, j * 2)[0] for j in range(len(raw) // 2)]
-                    + [0] * 256)[:256]
-            rgba = decode_c8(pixels, pal, w, h, tlut_fmt)
-            suf  = f"_p{p}" if n_pal > 1 else ""
-            path = out_dir / f"{idx:03d}_{w}x{h}_C8{suf}.png"
-            Image.frombytes('RGBA', (w, h), rgba).save(path)
-            saved.append(path)
 
+def _u16(d, o):
+    return struct.unpack_from('<H', d, o)[0]
+
+
+def _u32(d, o):
+    return struct.unpack_from('<I', d, o)[0]
+
+
+def _u64(d, o):
+    return struct.unpack_from('<Q', d, o)[0]
+
+
+def parse_bntx(data, base):
+    if data[base:base + 4] != b'BNTX' or data[base + 0x20:base + 0x24] != b'NX  ':
+        return
+    count, arr = _u32(data, base + 0x24), _u64(data, base + 0x28)
+    for i in range(count):
+        bo = base + _u64(data, base + arr + i * 8)
+        if data[bo:bo + 4] != b'BRTI':
+            continue
+        fmt = _u32(data, bo + 0x1c)
+        w, h, depth, layers, bh_log2 = struct.unpack_from('<5I', data, bo + 0x24)
+        mips = _u16(data, bo + 0x16)
+        name_ptr = _u64(data, bo + 0x60)
+        nlen = _u16(data, base + name_ptr)
+        name = data[base + name_ptr + 2:base + name_ptr + 2 + nlen].decode('utf-8', 'replace')
+        mip_arr = base + _u64(data, bo + 0x70)
+        fmt_name = BNTX_FMT.get(fmt >> 8, (f'unk{fmt:04x}',))[0]
+        yield {
+            'kind': 'bntx', 'offset': bo, 'name': name, 'fmt': fmt, 'fmt_name': fmt_name,
+            'width': w, 'height': h, 'levels': mips, 'layers': layers,
+            'tile_mode': _u16(data, bo + 0x12), 'block_height_log2': bh_log2 & 7,
+            'image_size': _u32(data, bo + 0x50),
+            'channels': list(data[bo + 0x58:bo + 0x5c]),
+            'mip_offsets': [base + _u64(data, mip_arr + m * 8) for m in range(mips)],
+            'valid': (fmt >> 8) in BNTX_FMT and (_u16(data, bo + 0x12) == 0) and w > 0 and h > 0,
+        }
+
+
+def _deswizzle_block_linear(raw, wb, hb, bpb, bh_log2):
+    gob_h = 8 << bh_log2
+    row_bytes = wb * bpb
+    gobs_x = -(-row_bytes // 64)
+    x = np.arange(row_bytes, dtype=np.int64)[None, :]
+    y = np.arange(hb, dtype=np.int64)[:, None]
+    addr = ((y // gob_h) * 512 * (1 << bh_log2) * gobs_x
+            + (x // 64) * 512 * (1 << bh_log2)
+            + ((y % gob_h) // 8) * 512
+            + ((x % 64) // 32) * 256 + ((y % 8) // 2) * 64
+            + ((x % 32) // 16) * 32 + (y % 2) * 16 + (x % 16))
+    src = np.frombuffer(raw, np.uint8)
+    if addr.max() >= len(src):
+        src = np.concatenate([src, np.zeros(int(addr.max()) + 1 - len(src), np.uint8)])
+    return src[addr].tobytes()
+
+
+def bntx_levels(data, info, layer=0):
+    _, bw, bh, bpb = BNTX_FMT[info['fmt'] >> 8]
+    layer_size = info['image_size'] // max(1, info['layers'])
+    for lv, off in enumerate(info['mip_offsets']):
+        w, h = max(1, info['width'] >> lv), max(1, info['height'] >> lv)
+        wb, hb = -(-w // bw), -(-h // bh)
+        lg = info['block_height_log2']
+        while lg > 0 and hb <= (1 << (lg - 1)) * 8:
+            lg -= 1
+        start = off + layer * layer_size
+        gob_h = 8 << lg
+        size = (-(-wb * bpb // 64) * 64) * (-(-hb // gob_h) * gob_h)
+        yield lv, w, h, _deswizzle_block_linear(data[start:start + size], wb, hb, bpb, lg)
+
+
+def decode_bntx_level(info, raw, w, h):
+    kind, bw, bh, bpb = BNTX_FMT[info['fmt'] >> 8]
+    if kind in _BCN_PIL:
+        n, pf, mode = _BCN_PIL[kind]
+        pw, ph = -(-w // 4) * 4, -(-h // 4) * 4
+        im = Image.frombytes(mode, (pw, ph), raw, 'bcn', (n, pf if (info['fmt'] & 0xff) != 2 else pf + 'S'))
+        a = np.asarray(im)
+        if mode == 'L':
+            a = np.stack([a, np.zeros_like(a), np.zeros_like(a), np.full_like(a, 255)], -1)
+        elif mode == 'RGB':
+            a = np.concatenate([a, np.full(a.shape[:2] + (1,), 255, np.uint8)], -1)
+        src = a[:h, :w]
+    else:
+        v = np.frombuffer(raw, np.uint8)[:w * h * bpb].reshape(h, w, bpb)
+        z, f = np.zeros((h, w), np.uint8), np.full((h, w), 255, np.uint8)
+        if kind == 'R8':
+            src = np.stack([v[..., 0], z, z, f], -1)
+        elif kind == 'RG8':
+            src = np.stack([v[..., 0], v[..., 1], z, f], -1)
+        elif kind == 'RGBA8':
+            src = v
+        elif kind == 'BGRA8':
+            src = v[..., [2, 1, 0, 3]]
+        elif kind == 'RGB565':
+            src = rgb565(v[..., 0].astype(np.uint16) | (v[..., 1].astype(np.uint16) << 8))
+        else:
+            u = v[..., 0].astype(np.uint16) | (v[..., 1].astype(np.uint16) << 8)
+            src = np.stack([_x4(u & 0xF), _x4((u >> 4) & 0xF), _x4((u >> 8) & 0xF), _x4(u >> 12)], -1)
+    sel = info['channels']
+    if sel != [2, 3, 4, 5] and all(c <= 5 for c in sel):
+        ext = np.concatenate([np.zeros(src.shape[:2] + (1,), np.uint8),
+                              np.full(src.shape[:2] + (1,), 255, np.uint8), src], -1)
+        src = ext[..., sel]
+    return np.ascontiguousarray(src, np.uint8)
+
+def _cstr(b):
+    return b.split(b'\0', 1)[0].decode('ascii', 'replace')
+
+
+def walk_arcl(data, base, end, path):
+    e = '>' if struct.unpack_from('>I', data, base + 8)[0] < 0x10000 else '<'
+    count, hsize = struct.unpack_from(e + 'II', data, base + 4)
+    for i in range(count):
+        eo = base + struct.unpack_from(e + 'I', data, base + hsize + i * 4)[0]
+        size, doff = struct.unpack_from(e + 'II', data, eo)
+        if size == 0:
+            continue
+        yield from walk(data, base + doff, base + doff + size, path + [f'{i:03d}'])
+
+
+def walk_wpt(data, base, end, path):
+    count = struct.unpack_from('>I', data, base + 0x10)[0]
+    offs = struct.unpack_from(f'>{count}I', data, base + 0x14)
+    for i, o in enumerate(offs):
+        if o:
+            yield from walk(data, base + 0x10 + o, end, path + [f'{i:03d}'])
+
+
+def walk_sarc(data, base, end, path):
+    data_off = _u32(data, base + 0x0c)
+    nodes = _u16(data, base + 0x1a)
+    names = base + 0x20 + nodes * 16 + 8
+    for i in range(nodes):
+        n = base + 0x20 + i * 16
+        attr, s, e = _u32(data, n + 4), _u32(data, n + 8), _u32(data, n + 12)
+        name = _cstr(data[names + (attr & 0xFFFFFF) * 4:names + (attr & 0xFFFFFF) * 4 + 256]) \
+            if attr >> 24 else f'{i:03d}'
+        label = os.path.splitext(name.replace('/', '_'))[0]
+        yield from walk(data, base + data_off + s, base + data_off + e, path + [label])
+
+
+def walk_bntx(data, base, end, path):
+    for info in parse_bntx(data, base):
+        yield path + [info['name']], info
+
+
+def walk_cmp(data, base, end, path):
+    count = struct.unpack_from('>I', data, base + 4)[0]
+    ents = [struct.unpack_from('>II', data, base + 8 + i * 8) for i in range(count)]
+    for i, (eid, o) in enumerate(ents):
+        nxt = ents[i + 1][1] if i + 1 < len(ents) else end - base
+        yield from walk(data, base + o, base + nxt, path + [f'{i:03d}_{eid:08x}'])
+
+
+def walk_menu(data, base, end, path):
+    pos = base + 0x18
+    while pos + 0x28 <= end and data[pos:pos + 3] != b'EOF':
+        typ = _cstr(data[pos:pos + 4])
+        name = _cstr(data[pos + 6:pos + 0x24])
+        size = struct.unpack_from('>I', data, pos + 0x24)[0]
+        if size:
+            label = f'{typ}_{os.path.splitext(name)[0]}'
+            yield from walk(data, pos + 0x28, pos + 0x28 + size, path + [label])
+        pos += 0x28 + size
+
+
+def walk_scan(data, base, end, path):
+    n = 0
+    pos = base
+    while True:
+        a = data.find(b'WST\x00', pos, end)
+        b = data.find(b'BNTX\x00\x00\x00\x00', pos, end)
+        hits = [h for h in (a, b) if h != -1]
+        if not hits:
+            return
+        pos = min(hits)
+        if pos == b:
+            texs = list(parse_bntx(data, pos))
+            for info in texs:
+                yield path + [f'{n:03d}', info['name']], info
+            n += 1
+            pos += max(4, _u32(data, pos + 0x1c)) if texs else 4
+        else:
+            info = parse_wst(data, pos)
+            if info and info['valid']:
+                yield path + [f'{n:03d}'], info
+                n += 1
+                pos += WST_HDR + info['data_size']
+            else:
+                pos += 4
+
+
+CONTAINERS = {b'ArcL': walk_arcl, b'WPT\x00': walk_wpt, b'CMP\x00': walk_cmp, b'Menu': walk_menu,
+              b'SARC': walk_sarc, b'BNTX': walk_bntx}
+CONTAINER_NAMES = {b'ArcL': 'ArcL', b'WPT\x00': 'WPT', b'CMP\x00': 'CMP', b'Menu': 'Menu',
+                   b'SARC': 'SARC', b'BNTX': 'BNTX', b'WST\x00': 'WST'}
+
+
+def texture_table(data, base=0):
+    if base + 8 > len(data):
+        return None
+    count = struct.unpack_from('>I', data, base)[0]
+    if not 0 < count < 0x4000 or base + 4 + count * 4 > len(data):
+        return None
+    offs = [v & 0xFFFFFF for v in struct.unpack_from(f'>{count}I', data, base + 4)]
+    if any(offs) and all(data[base + o:base + o + 4] == b'WST\x00' for o in offs if o):
+        return offs
+    return None
+
+
+def walk_texture_table(data, base, end, path):
+    for i, o in enumerate(texture_table(data, base)):
+        if o:
+            info = parse_wst(data, base + o)
+            if info:
+                yield path + [f'{i:03d}'], info
+
+
+def walk(data, base=0, end=None, path=None, scan_unknown=False):
+    end = len(data) if end is None else end
+    path = path or []
+    magic = data[base:base + 4]
+    if magic == b'WST\x00':
+        info = parse_wst(data, base)
+        if info:
+            yield path, info
+    elif magic in CONTAINERS:
+        yield from CONTAINERS[magic](data, base, end, path)
+    elif base == 0 and texture_table(data):
+        yield from walk_texture_table(data, base, end, path)
+    elif scan_unknown:
+        yield from walk_scan(data, base, end, path)
+
+
+def container_type(data):
+    if data[:4] not in CONTAINER_NAMES and texture_table(data):
+        return 'TexTable'
+    return CONTAINER_NAMES.get(data[:4])
+
+
+def _unique_palettes(pals):
+    """Drop duplicate palettes and filler palettes where every entry is the same."""
+    out, seen = [], set()
+    for i, p in enumerate(pals):
+        key = p.tobytes()
+        if key in seen or (i > 0 and (p == p[0]).all()):
+            continue
+        seen.add(key)
+        out.append((i, p))
+    return out
+
+
+def _save(rgba, out_base, suffix):
+    path = out_base.with_name(out_base.name + suffix + '.png')
+    Image.fromarray(np.ascontiguousarray(rgba), 'RGBA').save(path)
+    return path
+
+
+def extract_bntx(data, info, out_base, all_mips=False):
+    saved = []
+    for layer in range(info['layers']):
+        for lv, w, h, raw in bntx_levels(data, info, layer):
+            if lv > 0 and not all_mips:
+                break
+            suffix = (f'_layer{layer}' if info['layers'] > 1 else '') + (f'_mip{lv}' if lv else '')
+            saved.append(_save(decode_bntx_level(info, raw, w, h), out_base, suffix))
     return saved
 
 
-# CLI 
+def extract_texture(data, info, out_base, palettes='unique', all_mips=False):
+    if info['kind'] == 'bntx':
+        return extract_bntx(data, info, out_base, all_mips)
+    fmt = info['fmt']
+    saved = []
+    pals = wst_palettes(data, info)
+    if fmt in INDEXED:
+        if not pals:
+            choices = [(None, None)]
+        elif palettes == 'first':
+            choices = [(0, pals[0])]
+        elif palettes == 'all':
+            choices = list(enumerate(pals))
+        else:
+            choices = _unique_palettes(pals)
+    else:
+        choices = [(None, None)]
+
+    for lv, w, h, raw in wst_levels(data, info):
+        if lv > 0 and not all_mips:
+            break
+        for pi, pal in choices:
+            suffix = (f'_mip{lv}' if lv else '') + (f'_p{pi}' if pi is not None and len(choices) > 1 else '')
+            saved.append(_save(decode_level(fmt, raw, w, h, pal), out_base, suffix))
+    return saved
+
+
+def describe(path_parts, info):
+    where = '/'.join(path_parts) or '-'
+    if info['kind'] == 'bntx':
+        extra = f" layers={info['layers']}" if info['layers'] > 1 else ''
+        flag = '' if info['valid'] else '  UNSUPPORTED'
+        return (f"  {where:40s} {info['width']:4d}x{info['height']:<4d} {info['fmt_name']:6s} "
+                f"levels={info['levels']:<2d} fmt={info['fmt']:04x}{extra}{flag}")
+    pal = ''
+    if info['fmt'] in INDEXED:
+        npal = info['pal_size'] // max(2, info['pal_entries'] * 2)
+        pal = f"tlut={TLUT_FMT.get(info['tlut_fmt'], '?')} x{npal}"
+    elif info['pal_size']:
+        pal = f"extra={info['pal_size']:#x}"
+    flag = '' if info['valid'] else '  SIZE MISMATCH'
+    return (f"  {where:24s} {info['width']:4d}x{info['height']:<4d} "
+            f"{info['fmt_name']:6s} levels={info['levels']:<2d} id={info['id']:08x} {pal}{flag}")
+
+
+def process_file(src, out_dir, args, rel_name=None):
+    data = src.read_bytes()
+    ctype = container_type(data)
+    if ctype is None and not args.scan:
+        return None
+    label = rel_name or src.name
+    try:
+        entries = list(walk(data, scan_unknown=args.scan))
+    except (struct.error, IndexError, ValueError) as e:
+        print(f"{label}: {ctype or 'scan'}, ERROR while reading container: {e}")
+        return {'textures': 0, 'images': 0, 'errors': 1}
+
+    if args.list:
+        print(f"{label}  -  {ctype or 'scan'}, {len(entries)} texture(s)")
+        for parts, info in entries:
+            print(describe(parts, info))
+        return {'textures': len(entries), 'images': 0, 'errors': 0}
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    manifest, images, errors = [], 0, 0
+    for parts, info in entries:
+        stem = '_'.join(parts) if parts else '000'
+        stem += f"_{info['width']}x{info['height']}_{info['fmt_name']}"
+        stem = ''.join(c if c.isalnum() or c in '._-' else '_' for c in stem)
+        rec = {k: v for k, v in info.items() if k not in ('pal_start', 'pix_start', 'mip_offsets')}
+        rec['path'] = '/'.join(parts)
+        try:
+            if not info['valid']:
+                raise ValueError('unsupported format or header sizes do not match, skipped')
+            saved = extract_texture(data, info, out_dir / stem, args.palettes, args.mips)
+            rec['files'] = [p.name for p in saved]
+            images += len(saved)
+            if args.verbose:
+                print(describe(parts, info))
+        except Exception as e:
+            rec['error'] = str(e)
+            errors += 1
+            print(f"  {label}: {'/'.join(parts)}  ERROR: {e}")
+        manifest.append(rec)
+    if manifest:
+        (out_dir / '_manifest.json').write_text(json.dumps(manifest, indent=1))
+    print(f"{label}: {ctype or 'scan'}, {len(entries)} texture(s), {images} image(s)"
+          + (f", {errors} error(s)" if errors else ''))
+    return {'textures': len(entries), 'images': images, 'errors': errors}
+
 
 def main():
     ap = argparse.ArgumentParser(
-        description='Extract textures from a Go Vacation ArcL or WPT/WST file.',
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=None
-    )
-    ap.add_argument('input',  help='ArcL or WPT file to extract (e.g. TEX)')
+        description='Extract textures from Go Vacation (Wii / Switch) files: '
+                    'ArcL / WPT / CMP / Menu / WST (Wii) and SARC / BNTX (Switch).')
+    ap.add_argument('input', help='TEX file, or a folder (searched recursively)')
     ap.add_argument('output', nargs='?', default=None,
-                    help='Output directory (default: <input>_out/)')
-    ap.add_argument('-l', '--list',      action='store_true',
-                    help='List contents without extracting')
-    ap.add_argument('--cmpr-only',       action='store_true',
-                    help='Skip palette-indexed (C4/C8) entries')
-    ap.add_argument('-v', '--verbose',   action='store_true',
-                    help='Print header info for every entry')
+                    help='Output directory (default: <input>_out)')
+    ap.add_argument('-l', '--list', action='store_true', help='List textures without extracting')
+    ap.add_argument('-v', '--verbose', action='store_true', help='Print every texture')
+    ap.add_argument('--palettes', choices=['unique', 'first', 'all'], default='unique',
+                    help='Which palettes of C4/C8 textures to export (default: unique)')
+    ap.add_argument('--mips', action='store_true', help='Also export mipmap levels')
+    ap.add_argument('--all-files', action='store_true',
+                    help='Folder mode: process every file with a known magic, not only "TEX"')
+    ap.add_argument('--scan', action='store_true',
+                    help='Search unknown containers for embedded WST / BNTX textures')
     args = ap.parse_args()
 
-    src  = Path(args.input)
-    data = src.read_bytes()
+    src = Path(args.input)
+    out = Path(args.output) if args.output else src.parent / (src.name + '_out')
 
-    try:
-        container, entries = parse_file(data)
-    except ValueError as e:
-        print(f"Error: {src} - {e}")
-        sys.exit(1)
-
-    # consume generator into list so we can count
-    entry_list = [(idx, info) for idx, info in entries if info is not None]
-    count = len(entry_list)
-
-    if args.list:
-        print(f"{src.name}  -  {container} archive, {count} entries\n")
-        fmt_counts = {}
-        for idx, info in entry_list:
-            tag = info['fmt_name']
-            fmt_counts[tag] = fmt_counts.get(tag, 0) + 1
-            pf  = 'Working' if info['fmt'] in PALETTE_FREE else 'Warning: Needs palette'
-            print(f"  [{idx:3d}]  {info['width']:4d}x{info['height']:<4d}  "
-                  f"{tag:7s}  mips={info['mips']}  {pf}")
-        print(f"\nSummary: {', '.join(f'{v}x{k}' for k,v in sorted(fmt_counts.items()))}")
+    if src.is_file():
+        if process_file(src, out, args) is None:
+            print(f"Error: {src} - unknown container (magic={src.read_bytes()[:4]!r}); try --scan")
+            sys.exit(1)
         return
 
-    out_dir = Path(args.output) if args.output else src.parent / (src.name + '_out')
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    print(f"{container}: {count} entries  ->  {out_dir}/")
-
-    totals = {'ok': 0, 'skip': 0, 'err': 0}
-    fmt_counts = {}
-
-    for idx, info in entry_list:
-        fmt = info['fmt']
-        fmt_counts[info['fmt_name']] = fmt_counts.get(info['fmt_name'], 0) + 1
-
-        if fmt not in PALETTE_FREE and fmt not in PALETTE_NEEDED:
-            if args.verbose:
-                print(f"  [{idx:3d}]  {info['fmt_name']} - unsupported, skipping")
-            totals['skip'] += 1
+    totals = {'files': 0, 'textures': 0, 'images': 0, 'errors': 0}
+    empty_tex = 0
+    for f in sorted(p for p in src.rglob('*') if p.is_file()):
+        if not args.all_files and f.name.upper() != 'TEX':
             continue
-
-        if fmt in PALETTE_NEEDED and args.cmpr_only:
-            totals['skip'] += 1
+        if f.stat().st_size == 0:
+            empty_tex += f.name.upper() == 'TEX'
             continue
-
-        try:
-            saved = extract_entry(data, idx, info, out_dir,
-                                  skip_indexed=args.cmpr_only,
-                                  verbose=args.verbose)
-            totals['ok'] += len(saved)
-            if not args.verbose and saved:
-                print(f"  [{idx:3d}]  {', '.join(p.name for p in saved)}")
-        except Exception as e:
-            print(f"  [{idx:3d}]  ERROR: {e}")
-            totals['err'] += 1
-
-    print(f"\nDone  -  {totals['ok']} image(s) saved"
-          + (f", {totals['skip']} skipped" if totals['skip'] else "")
-          + (f", {totals['err']} error(s)" if totals['err'] else ""))
-    if fmt_counts:
-        print("Format breakdown: " + ', '.join(f"{v}x{k}" for k,v in sorted(fmt_counts.items())))
+        rel = f.relative_to(src)
+        r = process_file(f, out / rel.parent / rel.name, args, rel_name=str(rel))
+        if r:
+            totals['files'] += 1
+            for k in ('textures', 'images', 'errors'):
+                totals[k] += r[k]
+    print(f"\nDone - {totals['files']} file(s), {totals['textures']} texture(s), "
+          f"{totals['images']} image(s), {totals['errors']} error(s)")
+    if empty_tex and not args.all_files:
+        print(f"Note: {empty_tex} TEX file(s) are empty. This looks like the Switch dump, where "
+              f"textures live in MAPMODEL / ARC / CUBETEX / EFF ... files - use --all-files --scan.")
 
 
 if __name__ == '__main__':
